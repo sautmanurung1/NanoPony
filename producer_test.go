@@ -4,13 +4,14 @@ import (
 	"context"
 	"testing"
 
+	"github.com/segmentio/kafka-go"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func TestKafkaProducerProtobuf(t *testing.T) {
-	writer := NewKafkaWriter(KafkaWriterConfig{
-		Brokers: []string{"127.0.0.1:1"},
-	})
+	writer := &kafka.Writer{
+		Addr: kafka.TCP("localhost:1"),
+	}
 	producer := NewKafkaProducer(writer)
 	msg := &emptypb.Empty{}
 
@@ -40,9 +41,12 @@ func TestKafkaProducerProtobuf(t *testing.T) {
 }
 
 func TestKafkaProducerMarshaling(t *testing.T) {
-	writer := NewKafkaWriter(KafkaWriterConfig{
-		Brokers: []string{"127.0.0.1:1"},
-	})
+	// Test with a writer that will fail if it tries to send
+	writer := &kafka.Writer{
+		Addr:  kafka.TCP("localhost:1"), // Invalid addr
+		Topic: "test-topic",
+		Async: false,
+	}
 	producer := NewKafkaProducer(writer)
 
 	logger := NewLoggerFromOptions(LoggerOptions{ServiceName: "test"})
@@ -55,9 +59,7 @@ func TestKafkaProducerMarshaling(t *testing.T) {
 }
 
 func TestKafkaProducerClose(t *testing.T) {
-	writer := NewKafkaWriter(KafkaWriterConfig{
-		Brokers: []string{"127.0.0.1:1"},
-	})
+	writer := &kafka.Writer{}
 	producer := NewKafkaProducer(writer)
 	if err := producer.Close(); err != nil {
 		t.Errorf("Expected nil error from Close, got %v", err)
@@ -65,9 +67,7 @@ func TestKafkaProducerClose(t *testing.T) {
 }
 
 func TestKafkaProducerNilLogger(t *testing.T) {
-	writer := NewKafkaWriter(KafkaWriterConfig{
-		Brokers: []string{"127.0.0.1:1"},
-	})
+	writer := &kafka.Writer{Addr: kafka.TCP("localhost:1")}
 	producer := NewKafkaProducer(writer)
 	_, _ = producer.Produce("test", "msg", nil) // Should not panic
 }
