@@ -8,7 +8,6 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,24 +36,11 @@ var (
 
 	onceDirChecked sync.Once
 
-	// Overflow handling, configured once from env in initLogWorker.
-	logOverflowBlock bool          // LOG_OVERFLOW_POLICY=block
-	logBlockTimeout  time.Duration // LOG_BLOCK_TIMEOUT_MS
-	droppedLogs      atomic.Int64  // total logs dropped since start
-	pendingLogs      atomic.Int64  // logs queued but not yet written, per sink
+	// pendingLogs counts logs queued but not yet written, per sink.
+	pendingLogs atomic.Int64
 )
 
-const (
-	defaultLogBufferSize   = 10000
-	defaultLogBlockTimeout = 50 * time.Millisecond
-	logDropReportInterval  = 10 * time.Second
-)
-
-// DroppedLogs returns how many log writes were dropped because a log buffer was full.
-// In hybrid mode each sink (console, file, elasticsearch) counts separately.
-func DroppedLogs() int64 {
-	return droppedLogs.Load()
-}
+const defaultLogBufferSize = 10000
 
 // FlushLogs waits until every queued log has been written, or ctx is done.
 func FlushLogs(ctx context.Context) error {
@@ -79,45 +65,11 @@ func envInt(name string, def int) int {
 	return def
 }
 
-// enqueueLog puts req on ch, applying the overflow policy when ch is full.
-// ERROR and FATAL logs always wait for space so they are never dropped.
-// Returns false when the log was dropped.
-func enqueueLog(ch chan logRequest, req logRequest) bool {
-	select {
-	case ch <- req:
-		return true
-	default:
-	}
-
-	switch strings.ToUpper(req.entry.Level) {
-	case "ERROR", "FATAL":
-		ch <- req
-		return true
-	}
-
-	if logOverflowBlock {
-		timer := time.NewTimer(logBlockTimeout)
-		defer timer.Stop()
-		select {
-		case ch <- req:
-			return true
-		case <-timer.C:
-		}
-	}
-
-	droppedLogs.Add(1)
-	return false
-}
-
-// reportDroppedLogs prints one summary line per interval instead of one line per dropped log.
-func reportDroppedLogs() {
-	var last int64
-	for range time.Tick(logDropReportInterval) {
-		if total := droppedLogs.Load(); total > last {
-			fmt.Printf("[WARNING] dropped %d logs in last %s (total %d)\n", total-last, logDropReportInterval, total)
-			last = total
-		}
-	}
+// enqueueLog puts req on ch. Logs are never dropped: when ch is full the
+// caller waits until a worker frees space.
+func enqueueLog(ch chan logRequest, req logRequest) {
+	pendingLogs.Add(1)
+	ch <- req
 }
 
 // logRequest represents an internal request to process a log entry.
@@ -161,15 +113,11 @@ func (le *LoggerEntry) cloneUnlocked() *LoggerEntry {
 func initLogWorker() {
 	onceWorker.Do(func() {
 		size := envInt("LOG_BUFFER_SIZE", defaultLogBufferSize)
-		logOverflowBlock = strings.EqualFold(os.Getenv("LOG_OVERFLOW_POLICY"), "block")
-		logBlockTimeout = time.Duration(envInt("LOG_BLOCK_TIMEOUT_MS", int(defaultLogBlockTimeout/time.Millisecond))) * time.Millisecond
 
 		logChan = make(chan logRequest, size)
 		consoleChan = make(chan logRequest, size)
 		fileChan = make(chan logRequest, size)
 		esChan = make(chan logRequest, size)
-
-		go reportDroppedLogs()
 
 		// Main Dispatcher Worker
 		go func() {
@@ -201,8 +149,12 @@ func initLogWorker() {
 		// Dedicated Elasticsearch Worker (Realtime/Network dependent)
 		go func() {
 			for req := range esChan {
-				// Use the payload already inside req.entry
-				req.entry.writeToElasticsearch(nil)
+				// Use the payload already inside req.entry.
+				// If Elasticsearch fails, keep the log in the file instead of losing it
+				// (hybrid already writes the file through fileChan).
+				if !req.entry.writeToElasticsearch(nil) && req.mode != "hybrid" {
+					req.entry.writeToLogFile()
+				}
 				pendingLogs.Add(-1)
 			}
 		}()
@@ -231,16 +183,12 @@ func dispatchLogRequest(req logRequest) {
 	}
 }
 
-// sendToSink sends a request to a sink channel using the overflow policy.
-// If a specific sink stays full, the log is dropped for THAT sink only.
+// sendToSink sends a request to a sink channel, waiting while the sink is full.
 func sendToSink(ch chan logRequest, req logRequest) {
 	if ch == nil {
 		return
 	}
-	pendingLogs.Add(1)
-	if !enqueueLog(ch, req) {
-		pendingLogs.Add(-1)
-	}
+	enqueueLog(ch, req)
 }
 
 // initLoggerFile sets up the rolling file writer exactly once.
@@ -297,14 +245,15 @@ func (le *LoggerEntry) writeToConsole() {
 
 // writeToElasticsearch sends the entry and its payload to an Elasticsearch index.
 // The index name follows the pattern: <ELASTIC_PREFIX_INDEX><YYYYMMDD>
-func (le *LoggerEntry) writeToElasticsearch(payload any) {
+// Returns false when the log was not stored in Elasticsearch.
+func (le *LoggerEntry) writeToElasticsearch(payload any) bool {
 	if err := ensureElasticsearchClient(); err != nil {
-		return
+		return false
 	}
 
 	conf := getAppConfig()
 	if conf == nil {
-		return
+		return false
 	}
 
 	payloadMap := processPayload(payload)
@@ -316,16 +265,21 @@ func (le *LoggerEntry) writeToElasticsearch(payload any) {
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[NanoPony-Logger] Failed to marshal log for Elasticsearch: %v\n", err)
-		return
+		return false
 	}
 
 	esIndexWithDate := conf.ElasticSearch.ElasticPrefixIndex + time.Now().Format("20060102")
 	res, err := esClient.Index(esIndexWithDate, bytes.NewReader(data))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[NanoPony-Logger] Failed to send log to Elasticsearch: %v\n", err)
-		return
+		return false
 	}
-	_ = res.Body.Close()
+	defer res.Body.Close()
+	if res.IsError() {
+		fmt.Fprintf(os.Stderr, "[NanoPony-Logger] Elasticsearch rejected log: %s\n", res.Status())
+		return false
+	}
+	return true
 }
 
 // processPayload normalizes various payload types into a map[string]any for JSON logging.

@@ -14,13 +14,9 @@
 //	   ├── fileWorker          → rolling log file (lumberjack)
 //	   └── esWorker            → ES index
 //
-// When a channel is full, LOG_OVERFLOW_POLICY decides what happens:
-//   - "drop" (default): drop the log for that channel only.
-//   - "block": wait up to LOG_BLOCK_TIMEOUT_MS (default 50) for space, then drop.
-//
-// ERROR and FATAL logs always wait for space and are never dropped.
-// Dropped logs are counted (DroppedLogs) and summarised every 10s on stdout.
-// Call FlushLogs before exit to write logs still in the buffers.
+// Logs are never dropped. When a channel is full, the caller waits until a
+// worker frees space. If Elasticsearch fails, the log is written to the log
+// file instead. Call FlushLogs before exit to write logs still in the buffers.
 package nanopony
 
 import (
@@ -159,10 +155,7 @@ func (le *LoggerEntry) sendLog(level, mode string, payload any, response Respons
 	le.mu.Unlock()
 
 	if logChan != nil {
-		pendingLogs.Add(1)
-		if !enqueueLog(logChan, logRequest{entry: snapshot, mode: mode}) {
-			pendingLogs.Add(-1)
-		}
+		enqueueLog(logChan, logRequest{entry: snapshot, mode: mode})
 	}
 }
 

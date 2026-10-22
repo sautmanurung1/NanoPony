@@ -3,7 +3,9 @@ package nanopony
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -368,99 +370,60 @@ func TestLoggerConsoleCreatesFile(t *testing.T) {
 	}
 }
 
-// withOverflowPolicy sets the overflow globals for one test and restores them after.
-func withOverflowPolicy(t *testing.T, block bool, timeout time.Duration) {
-	t.Helper()
-	oldBlock, oldTimeout := logOverflowBlock, logBlockTimeout
-	logOverflowBlock, logBlockTimeout = block, timeout
-	t.Cleanup(func() { logOverflowBlock, logBlockTimeout = oldBlock, oldTimeout })
-}
-
 func newTestLogRequest(level string) logRequest {
 	return logRequest{entry: &LoggerEntry{Level: level}, mode: "console"}
 }
 
-func TestEnqueueLogDropPolicyCountsDrops(t *testing.T) {
-	withOverflowPolicy(t, false, 0)
-	ch := make(chan logRequest, 10)
-	before := DroppedLogs()
-
-	sent := 0
-	for i := 0; i < 25; i++ {
-		if enqueueLog(ch, newTestLogRequest("INFO")) {
-			sent++
-		}
-	}
-
-	if sent != 10 {
-		t.Errorf("expected 10 logs queued, got %d", sent)
-	}
-	if got := DroppedLogs() - before; got != 15 {
-		t.Errorf("expected 15 dropped logs counted, got %d", got)
-	}
-}
-
-func TestEnqueueLogBlockPolicy(t *testing.T) {
-	withOverflowPolicy(t, true, 20*time.Millisecond)
+func TestEnqueueLogNeverDrops(t *testing.T) {
 	ch := make(chan logRequest, 1)
-	ch <- newTestLogRequest("INFO")
-	before := DroppedLogs()
-
-	// Nobody drains: waits for the timeout, then drops.
-	start := time.Now()
-	if enqueueLog(ch, newTestLogRequest("INFO")) {
-		t.Fatal("expected log to be dropped after timeout")
-	}
-	if waited := time.Since(start); waited < 20*time.Millisecond {
-		t.Errorf("expected to wait for timeout, waited %s", waited)
-	}
-	if got := DroppedLogs() - before; got != 1 {
-		t.Errorf("expected 1 dropped log counted, got %d", got)
-	}
-
-	// A slow sink frees space within the timeout: log is kept.
-	go func() {
-		time.Sleep(5 * time.Millisecond)
-		<-ch
-	}()
-	if !enqueueLog(ch, newTestLogRequest("INFO")) {
-		t.Error("expected log to be queued once the sink drained")
-	}
-}
-
-func TestEnqueueLogNeverDropsErrors(t *testing.T) {
-	withOverflowPolicy(t, false, 0)
-	ch := make(chan logRequest, 1)
-	before := DroppedLogs()
 
 	// Slow sink
 	received := make(chan int)
 	go func() {
 		n := 0
 		for range ch {
-			time.Sleep(time.Millisecond)
+			time.Sleep(100 * time.Microsecond)
+			pendingLogs.Add(-1)
 			n++
 		}
 		received <- n
 	}()
 
-	const total = 50
+	// Far more logs than the buffer holds, every level
+	const total = 500
+	levels := []string{"DEBUG", "INFO", "WARNING", "ERROR"}
 	for i := 0; i < total; i++ {
-		level := "ERROR"
-		if i%2 == 0 {
-			level = "fatal"
-		}
-		if !enqueueLog(ch, newTestLogRequest(level)) {
-			t.Fatalf("error log %d was dropped", i)
-		}
+		enqueueLog(ch, newTestLogRequest(levels[i%len(levels)]))
 	}
 	close(ch)
 
 	if n := <-received; n != total {
-		t.Errorf("expected %d error logs delivered, got %d", total, n)
+		t.Errorf("expected all %d logs delivered, got %d", total, n)
 	}
-	if got := DroppedLogs() - before; got != 0 {
-		t.Errorf("expected no dropped logs, got %d", got)
+}
+
+func TestElasticsearchFailureFallsBackToFile(t *testing.T) {
+	esClientMutex.Lock()
+	esClient = nil
+	esClientMutex.Unlock()
+	t.Setenv("ELASTIC_HOST", "")
+
+	msg := fmt.Sprintf("es-fallback-%d", time.Now().UnixNano())
+	logger := NewLoggerFromOptions(LoggerOptions{ServiceName: "es-fallback-test"})
+	logger.SendToElasticSearch("INFO", nil, ResponseLog{Message: msg})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := FlushLogs(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	data, err := os.ReadFile(logFileWriter.Filename)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	if !strings.Contains(string(data), msg) {
+		t.Errorf("expected log %q in %s after Elasticsearch failure", msg, logFileWriter.Filename)
 	}
 }
 
