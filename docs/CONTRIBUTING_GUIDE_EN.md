@@ -42,7 +42,7 @@ NanoPony does not process data directly in a single loop. Data is wrapped into a
 
 ### 3. Poller & Semaphore (`poller.go`)
 The Poller is responsible for fetching data periodically.
-* **Slot/Semaphore**: We use a channel as a semaphore (`jobSlots`). If `JobSlotSize` is 1, the next poll will not run until the previous one completes. This prevents duplicate processing of the same data.
+* **Slot/Semaphore**: We use a channel as a semaphore (`jobSlots`). If `JobSlotSize` is 1, the next fetch will not run until the previous fetch + submit completes. A slot does not wait for jobs to be processed; use `WaitForCompletion` for that so the same data is not processed twice.
 * **DataFetcher**: An interface. You can create a fetcher from a Database, API, or File, as long as it returns `[]any`.
 
 ### 4. Structured Logging (`logger.go`)
