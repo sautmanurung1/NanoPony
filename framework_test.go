@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/segmentio/kafka-go"
 )
 
 func TestNewFramework(t *testing.T) {
@@ -234,7 +235,7 @@ func TestFrameworkCheckReadiness(t *testing.T) {
 	}
 
 	// Kafka writer with no brokers
-	components.KafkaWriter = &KafkaWriter{}
+	components.KafkaWriter = &kafka.Writer{}
 	if err := components.CheckReadiness(ctx); err == nil {
 		t.Error("Expected error for Kafka writer with no brokers")
 	}

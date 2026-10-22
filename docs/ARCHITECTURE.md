@@ -29,7 +29,7 @@
 
 **Fitur Utama:**
 - ✅ **Ultra-Efficient sync.Pool** - Reuse objek Job untuk performa tinggi dan GC yang ringan
-- ✅ **Kafka Producer & Consumer** - Integrasi Kafka native murni Golang standard library (Zero external dependency)
+- ✅ **Kafka Producer & Consumer** - Integrasi dengan Kafka menggunakan `kafka-go`
 - ✅ **Oracle Database** - Koneksi menggunakan `go-ora` dengan connection pooling
 - ✅ **Worker Pool** - Pemrosesan job konkuren dengan queue bounded
 - ✅ **Poller** - Pengambilan data periodik dengan interval yang dapat dikonfigurasi
@@ -39,7 +39,7 @@
 - ✅ **Logging Terstruktur** - Rotasi file dan integrasi Elasticsearch
 
 **Dependensi Inti:**
-- `Native Go Protocol` - Native Kafka client (100% Go Standard Library)
+- `segmentio/kafka-go` - Kafka client
 - `sijms/go-ora/v2` - Oracle driver
 - `elastic/go-elasticsearch/v8` - Elasticsearch client
 - `joho/godotenv` - Environment variables loader
@@ -616,7 +616,7 @@ func main() {
 
 NanoPony menyediakan:
 
-✅ **Kafka Producer & Consumer** - Integrasi Kafka native pure Go protocol (Zero 3rd party dependency)  
+✅ **Kafka Producer & Consumer** - Integrasi Kafka dengan `kafka-go`  
 ✅ **Oracle Database** - Koneksi Oracle dengan connection pooling  
 ✅ **Worker Pool** - Pemrosesan job konkuren dengan queue bounded  
 ✅ **Poller** - Pengambilan data periodik dengan interval yang dapat dikonfigurasi  
