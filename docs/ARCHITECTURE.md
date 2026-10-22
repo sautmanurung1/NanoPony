@@ -439,6 +439,9 @@ type KafkaWriterConfig struct {
 | `ELASTIC_PASSWORD` | Password Elasticsearch | `secret` |
 | `ELASTIC_INDEX_DATA` | Nama index Elasticsearch | `nanopony-logs` |
 | `LOG_OUTPUT_MODE` | Mode output logger | `console`, `file`, `elasticsearch`, `hybrid` |
+| `LOG_BUFFER_SIZE` | Kapasitas buffer log per channel | Angka, default `10000` |
+| `LOG_OVERFLOW_POLICY` | Perilaku saat buffer log penuh | `drop` (default), `block`. Log `ERROR`/`FATAL` tidak pernah di-drop |
+| `LOG_BLOCK_TIMEOUT_MS` | Batas tunggu untuk `block` | Milidetik, default `50` |
 | `LOG_FILE_PREFIX` | Prefix nama file log | `any-prefix` (Default: `orion-to-core`) |
 
 ### Struktur Konfigurasi

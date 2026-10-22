@@ -1,6 +1,7 @@
 package nanopony
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"testing"
@@ -364,5 +365,139 @@ func TestLoggerConsoleCreatesFile(t *testing.T) {
 	files, err := os.ReadDir("./logs")
 	if err != nil || len(files) == 0 {
 		t.Errorf("Expected log file to be created for console mode, got error or no files: %v", err)
+	}
+}
+
+// withOverflowPolicy sets the overflow globals for one test and restores them after.
+func withOverflowPolicy(t *testing.T, block bool, timeout time.Duration) {
+	t.Helper()
+	oldBlock, oldTimeout := logOverflowBlock, logBlockTimeout
+	logOverflowBlock, logBlockTimeout = block, timeout
+	t.Cleanup(func() { logOverflowBlock, logBlockTimeout = oldBlock, oldTimeout })
+}
+
+func newTestLogRequest(level string) logRequest {
+	return logRequest{entry: &LoggerEntry{Level: level}, mode: "console"}
+}
+
+func TestEnqueueLogDropPolicyCountsDrops(t *testing.T) {
+	withOverflowPolicy(t, false, 0)
+	ch := make(chan logRequest, 10)
+	before := DroppedLogs()
+
+	sent := 0
+	for i := 0; i < 25; i++ {
+		if enqueueLog(ch, newTestLogRequest("INFO")) {
+			sent++
+		}
+	}
+
+	if sent != 10 {
+		t.Errorf("expected 10 logs queued, got %d", sent)
+	}
+	if got := DroppedLogs() - before; got != 15 {
+		t.Errorf("expected 15 dropped logs counted, got %d", got)
+	}
+}
+
+func TestEnqueueLogBlockPolicy(t *testing.T) {
+	withOverflowPolicy(t, true, 20*time.Millisecond)
+	ch := make(chan logRequest, 1)
+	ch <- newTestLogRequest("INFO")
+	before := DroppedLogs()
+
+	// Nobody drains: waits for the timeout, then drops.
+	start := time.Now()
+	if enqueueLog(ch, newTestLogRequest("INFO")) {
+		t.Fatal("expected log to be dropped after timeout")
+	}
+	if waited := time.Since(start); waited < 20*time.Millisecond {
+		t.Errorf("expected to wait for timeout, waited %s", waited)
+	}
+	if got := DroppedLogs() - before; got != 1 {
+		t.Errorf("expected 1 dropped log counted, got %d", got)
+	}
+
+	// A slow sink frees space within the timeout: log is kept.
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		<-ch
+	}()
+	if !enqueueLog(ch, newTestLogRequest("INFO")) {
+		t.Error("expected log to be queued once the sink drained")
+	}
+}
+
+func TestEnqueueLogNeverDropsErrors(t *testing.T) {
+	withOverflowPolicy(t, false, 0)
+	ch := make(chan logRequest, 1)
+	before := DroppedLogs()
+
+	// Slow sink
+	received := make(chan int)
+	go func() {
+		n := 0
+		for range ch {
+			time.Sleep(time.Millisecond)
+			n++
+		}
+		received <- n
+	}()
+
+	const total = 50
+	for i := 0; i < total; i++ {
+		level := "ERROR"
+		if i%2 == 0 {
+			level = "fatal"
+		}
+		if !enqueueLog(ch, newTestLogRequest(level)) {
+			t.Fatalf("error log %d was dropped", i)
+		}
+	}
+	close(ch)
+
+	if n := <-received; n != total {
+		t.Errorf("expected %d error logs delivered, got %d", total, n)
+	}
+	if got := DroppedLogs() - before; got != 0 {
+		t.Errorf("expected no dropped logs, got %d", got)
+	}
+}
+
+func TestFlushLogs(t *testing.T) {
+	pendingLogs.Add(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := FlushLogs(ctx); err == nil {
+		t.Error("expected flush to time out while a log is pending")
+	}
+
+	pendingLogs.Add(-1)
+	if err := FlushLogs(context.Background()); err != nil {
+		t.Errorf("expected flush to succeed, got %v", err)
+	}
+
+	// Real pipeline: everything queued gets written.
+	logger := NewLoggerFromOptions(LoggerOptions{ServiceName: "flush-test"})
+	for i := 0; i < 100; i++ {
+		logger.SendToFile("INFO", ResponseLog{Message: "flush"})
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if err := FlushLogs(ctx2); err != nil {
+		t.Errorf("expected queued logs to be flushed, got %v", err)
+	}
+}
+
+func TestEnvInt(t *testing.T) {
+	t.Setenv("NANOPONY_TEST_INT", "42")
+	if got := envInt("NANOPONY_TEST_INT", 7); got != 42 {
+		t.Errorf("expected 42, got %d", got)
+	}
+	for _, v := range []string{"", "abc", "0", "-5"} {
+		t.Setenv("NANOPONY_TEST_INT", v)
+		if got := envInt("NANOPONY_TEST_INT", 7); got != 7 {
+			t.Errorf("value %q: expected default 7, got %d", v, got)
+		}
 	}
 }

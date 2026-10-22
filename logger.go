@@ -6,7 +6,7 @@
 //	   ↓
 //	LoggerEntry.LoggingData(level, payload, response)
 //	   ↓
-//	logChan (buffered channel, cap=1000)
+//	logChan (buffered channel, cap=LOG_BUFFER_SIZE, default 10000)
 //	   ↓
 //	background dispatcher goroutine
 //	   ↓ dispatches to specialized sink workers (non-blocking):
@@ -14,8 +14,13 @@
 //	   ├── fileWorker          → rolling log file (lumberjack)
 //	   └── esWorker            → ES index
 //
-// All logging is non-blocking. If a specific sink's channel is full, that
-// specific output is dropped to prevent blocking the entire logging pipeline.
+// When a channel is full, LOG_OVERFLOW_POLICY decides what happens:
+//   - "drop" (default): drop the log for that channel only.
+//   - "block": wait up to LOG_BLOCK_TIMEOUT_MS (default 50) for space, then drop.
+//
+// ERROR and FATAL logs always wait for space and are never dropped.
+// Dropped logs are counted (DroppedLogs) and summarised every 10s on stdout.
+// Call FlushLogs before exit to write logs still in the buffers.
 package nanopony
 
 import (
@@ -154,10 +159,9 @@ func (le *LoggerEntry) sendLog(level, mode string, payload any, response Respons
 	le.mu.Unlock()
 
 	if logChan != nil {
-		select {
-		case logChan <- logRequest{entry: snapshot, mode: mode}:
-		default:
-			fmt.Printf("[WARNING] Log channel full, dropping log\n")
+		pendingLogs.Add(1)
+		if !enqueueLog(logChan, logRequest{entry: snapshot, mode: mode}) {
+			pendingLogs.Add(-1)
 		}
 	}
 }

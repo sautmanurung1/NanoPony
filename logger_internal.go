@@ -2,11 +2,15 @@ package nanopony
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
@@ -32,7 +36,89 @@ var (
 	onceCachedWd sync.Once
 
 	onceDirChecked sync.Once
+
+	// Overflow handling, configured once from env in initLogWorker.
+	logOverflowBlock bool          // LOG_OVERFLOW_POLICY=block
+	logBlockTimeout  time.Duration // LOG_BLOCK_TIMEOUT_MS
+	droppedLogs      atomic.Int64  // total logs dropped since start
+	pendingLogs      atomic.Int64  // logs queued but not yet written, per sink
 )
+
+const (
+	defaultLogBufferSize   = 10000
+	defaultLogBlockTimeout = 50 * time.Millisecond
+	logDropReportInterval  = 10 * time.Second
+)
+
+// DroppedLogs returns how many log writes were dropped because a log buffer was full.
+// In hybrid mode each sink (console, file, elasticsearch) counts separately.
+func DroppedLogs() int64 {
+	return droppedLogs.Load()
+}
+
+// FlushLogs waits until every queued log has been written, or ctx is done.
+func FlushLogs(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for pendingLogs.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("flush logs: %d still pending: %w", pendingLogs.Load(), ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	return nil
+}
+
+// envInt reads a positive integer env var, falling back to def.
+func envInt(name string, def int) int {
+	if n, err := strconv.Atoi(os.Getenv(name)); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+// enqueueLog puts req on ch, applying the overflow policy when ch is full.
+// ERROR and FATAL logs always wait for space so they are never dropped.
+// Returns false when the log was dropped.
+func enqueueLog(ch chan logRequest, req logRequest) bool {
+	select {
+	case ch <- req:
+		return true
+	default:
+	}
+
+	switch strings.ToUpper(req.entry.Level) {
+	case "ERROR", "FATAL":
+		ch <- req
+		return true
+	}
+
+	if logOverflowBlock {
+		timer := time.NewTimer(logBlockTimeout)
+		defer timer.Stop()
+		select {
+		case ch <- req:
+			return true
+		case <-timer.C:
+		}
+	}
+
+	droppedLogs.Add(1)
+	return false
+}
+
+// reportDroppedLogs prints one summary line per interval instead of one line per dropped log.
+func reportDroppedLogs() {
+	var last int64
+	for range time.Tick(logDropReportInterval) {
+		if total := droppedLogs.Load(); total > last {
+			fmt.Printf("[WARNING] dropped %d logs in last %s (total %d)\n", total-last, logDropReportInterval, total)
+			last = total
+		}
+	}
+}
 
 // logRequest represents an internal request to process a log entry.
 type logRequest struct {
@@ -74,15 +160,22 @@ func (le *LoggerEntry) cloneUnlocked() *LoggerEntry {
 // initLogWorker initializes the background log processing goroutines exactly once.
 func initLogWorker() {
 	onceWorker.Do(func() {
-		logChan = make(chan logRequest, 1000)
-		consoleChan = make(chan logRequest, 1000)
-		fileChan = make(chan logRequest, 1000)
-		esChan = make(chan logRequest, 1000)
+		size := envInt("LOG_BUFFER_SIZE", defaultLogBufferSize)
+		logOverflowBlock = strings.EqualFold(os.Getenv("LOG_OVERFLOW_POLICY"), "block")
+		logBlockTimeout = time.Duration(envInt("LOG_BLOCK_TIMEOUT_MS", int(defaultLogBlockTimeout/time.Millisecond))) * time.Millisecond
+
+		logChan = make(chan logRequest, size)
+		consoleChan = make(chan logRequest, size)
+		fileChan = make(chan logRequest, size)
+		esChan = make(chan logRequest, size)
+
+		go reportDroppedLogs()
 
 		// Main Dispatcher Worker
 		go func() {
 			for req := range logChan {
 				dispatchLogRequest(req)
+				pendingLogs.Add(-1)
 			}
 		}()
 
@@ -93,6 +186,7 @@ func initLogWorker() {
 				if req.mode == "console" {
 					req.entry.writeToLogFile()
 				}
+				pendingLogs.Add(-1)
 			}
 		}()
 
@@ -100,6 +194,7 @@ func initLogWorker() {
 		go func() {
 			for req := range fileChan {
 				req.entry.writeToLogFile()
+				pendingLogs.Add(-1)
 			}
 		}()
 
@@ -108,6 +203,7 @@ func initLogWorker() {
 			for req := range esChan {
 				// Use the payload already inside req.entry
 				req.entry.writeToElasticsearch(nil)
+				pendingLogs.Add(-1)
 			}
 		}()
 	})
@@ -135,15 +231,15 @@ func dispatchLogRequest(req logRequest) {
 	}
 }
 
-// sendToSink attempts to send a request to a sink channel without blocking the dispatcher.
+// sendToSink sends a request to a sink channel using the overflow policy.
+// If a specific sink stays full, the log is dropped for THAT sink only.
 func sendToSink(ch chan logRequest, req logRequest) {
 	if ch == nil {
 		return
 	}
-	select {
-	case ch <- req:
-	default:
-		// If a specific sink is full, we drop the log for THAT sink only.
+	pendingLogs.Add(1)
+	if !enqueueLog(ch, req) {
+		pendingLogs.Add(-1)
 	}
 }
 
