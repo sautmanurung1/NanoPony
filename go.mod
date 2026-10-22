@@ -1,6 +1,6 @@
 module github.com/sautmanurung2/nanopony
 
-go 1.25.1
+go 1.27.3
 
 require (
 	github.com/elastic/go-elasticsearch/v8 v8.19.6
