@@ -160,3 +160,59 @@ func TestPollerBlockingSubmitPreventsJobLoss(t *testing.T) {
 		t.Errorf("Expected %d jobs processed (no job loss), got %d", expectedJobs, processed.Load())
 	}
 }
+
+func TestPollerWaitForCompletionNoFetchOverlap(t *testing.T) {
+	pool := NewWorkerPool(1, 1, 1)
+	ctx := context.Background()
+
+	var inFlight, overlaps, processed atomic.Int64
+	pool.Start(ctx, func(ctx context.Context, job *Job) error {
+		inFlight.Add(1)
+		time.Sleep(30 * time.Millisecond) // slower than the poll interval
+		processed.Add(1)
+		inFlight.Add(-1)
+		return nil
+	})
+	defer pool.Stop()
+
+	var fetches atomic.Int64
+	fetcher := DataFetcherFunc(func(ctx context.Context) ([]any, error) {
+		fetches.Add(1)
+		if inFlight.Load() > 0 {
+			overlaps.Add(1)
+		}
+		return []any{"row"}, nil
+	})
+
+	config := DefaultPollerConfig()
+	config.Interval = 5 * time.Millisecond
+	config.WaitForCompletion = true
+
+	poller := NewPoller(config, pool, fetcher)
+	poller.Start()
+	time.Sleep(200 * time.Millisecond)
+	poller.Stop()
+
+	if overlaps.Load() != 0 {
+		t.Errorf("Fetch overlapped with job processing %d times", overlaps.Load())
+	}
+	if fetches.Load() < 2 {
+		t.Errorf("expected poller to keep fetching after jobs finish, got %d fetches", fetches.Load())
+	}
+	if processed.Load() == 0 {
+		t.Error("expected jobs to be processed")
+	}
+}
+
+func TestJobReleaseCallsOnDoneOnce(t *testing.T) {
+	var calls atomic.Int64
+	job := AcquireJob()
+	job.onDone = func() { calls.Add(1) }
+
+	job.Release()
+	job.Release()
+
+	if calls.Load() != 1 {
+		t.Errorf("expected onDone to run once, got %d", calls.Load())
+	}
+}

@@ -16,8 +16,14 @@ type PollerConfig struct {
 	Interval time.Duration
 	// BatchSize is the maximum number of items to process per batch iteration
 	BatchSize int
-	// JobSlotSize controls how many concurrent poll operations are allowed to fetch data
+	// JobSlotSize controls how many concurrent poll operations are allowed to fetch data.
+	// A slot only covers fetch + submit, not job processing, unless WaitForCompletion is set.
 	JobSlotSize int
+	// WaitForCompletion makes each poll wait until every job it submitted has been
+	// processed (or dumped to recovery) before the next Fetch runs. Enable it for
+	// outbox/staging-table patterns (fetch -> produce -> delete) so rows still being
+	// processed are not fetched and produced again.
+	WaitForCompletion bool
 }
 
 // DefaultPollerConfig returns default poller configuration with sensible defaults.
@@ -147,6 +153,11 @@ func (p *Poller) pollUntilEmpty() {
 
 // pollOnce performs a single polling iteration and returns the number of items fetched.
 func (p *Poller) pollOnce() (int, error) {
+	// Never start a new fetch once the poller is stopping
+	if p.ctx.Err() != nil {
+		return 0, nil
+	}
+
 	// Try to acquire a job slot (rate limiting)
 	select {
 	case <-p.jobSlots:
@@ -177,6 +188,8 @@ func (p *Poller) pollOnce() (int, error) {
 		data = data[:p.config.BatchSize]
 	}
 
+	var pending sync.WaitGroup
+
 	for _, item := range data {
 		jobID := atomic.AddInt64(&p.jobCounter, 1)
 		job := AcquireJob()
@@ -197,6 +210,11 @@ func (p *Poller) pollOnce() (int, error) {
 		job.Meta["source"] = "poller"
 		job.Meta["timestamp"] = time.Now().Unix()
 
+		if p.config.WaitForCompletion {
+			pending.Add(1)
+			job.onDone = pending.Done
+		}
+
 		// Use context.Background() to ensure data is never dropped due to context cancellation
 		// while waiting in the SubmitBlocking retry loop (100% Data Guarantee).
 		if err := p.workerPool.SubmitBlocking(context.Background(), job); err != nil {
@@ -207,7 +225,26 @@ func (p *Poller) pollOnce() (int, error) {
 		}
 	}
 
+	if p.config.WaitForCompletion {
+		p.waitForJobs(&pending)
+	}
+
 	return originalLen, nil
+}
+
+// waitForJobs blocks until all jobs from the current poll are released,
+// or the poller is stopped.
+func (p *Poller) waitForJobs(pending *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		pending.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-p.ctx.Done():
+	}
 }
 
 // releaseSlot returns a token to the jobSlots channel.

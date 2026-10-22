@@ -186,6 +186,13 @@ err := pool.SubmitBlocking(ctx, job)
 ### Mekanisme Slot (Semaphore)
 Poller menggunakan `JobSlotSize` untuk membatasi berapa banyak operasi polling yang boleh berjalan secara bersamaan. Jika slot penuh (misalnya karena polling sebelumnya masih berlangsung), polling berikutnya akan dilewati (*skipped*).
 
+Slot hanya mencakup **fetch + submit**, bukan pemrosesan job. Setelah job masuk queue, `Fetch()` berikutnya bisa berjalan selagi job sebelumnya masih diproses. Untuk pola outbox/staging table (fetch → produce ke Kafka → delete baris), ini bisa membuat baris yang sebentar lagi di-delete ter-fetch dan ter-produce dua kali. Aktifkan `WaitForCompletion: true` agar setiap polling menunggu semua job-nya selesai diproses (atau di-dump ke recovery) sebelum `Fetch()` berikutnya:
+
+```go
+config := nanopony.DefaultPollerConfig()
+config.WaitForCompletion = true
+```
+
 ### Optimasi ID Pekerjaan (Mei 2026)
 Setiap pekerjaan yang dihasilkan oleh Poller memiliki ID format: `poll-[SessionID]-[Counter]`.
 - **SessionID**: Berbasis timestamp saat aplikasi dijalankan.

@@ -42,7 +42,7 @@ NanoPony tidak langsung memproses data di satu loop. Data dibungkus menjadi `Job
 
 ### 3. Poller & Semaphore (`poller.go`)
 Poller bertugas menarik data secara periodik.
-* **Slot/Semaphore:** Kami menggunakan channel sebagai semaphore (`jobSlots`). Jika `JobSlotSize` adalah 1, maka poller berikutnya tidak akan jalan sebelum poller sebelumnya selesai. Ini mencegah duplikasi pemrosesan data yang sama.
+* **Slot/Semaphore:** Kami menggunakan channel sebagai semaphore (`jobSlots`). Jika `JobSlotSize` adalah 1, maka fetch berikutnya tidak akan jalan sebelum fetch + submit sebelumnya selesai. Slot tidak menunggu job selesai diproses; gunakan `WaitForCompletion` untuk itu agar data yang sama tidak diproses dua kali.
 * **DataFetcher:** Sebuah interface. Kamu bisa membuat fetcher dari Database, API, atau File, selama ia mengembalikan `[]any`.
 
 ### 4. Sistem Logging Terstruktur (`logger.go`)

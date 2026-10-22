@@ -253,6 +253,7 @@ type KafkaWriterConfig struct {
       RetryDelay  time.Duration
       BatchSize   int
       JobSlotSize int
+      WaitForCompletion bool
   }
   ```
 - `Poller` - Menampung config, job slots (channel semaphore), referensi worker pool, data fetcher, context

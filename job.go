@@ -17,6 +17,9 @@ type Job struct {
 	Meta map[string]any
 
 	inUse atomic.Bool
+	// onDone runs once when the job is released, i.e. after the handler
+	// finished, the job was dumped to recovery, or submission failed.
+	onDone func()
 }
 
 var jobPool = sync.Pool{
@@ -43,6 +46,10 @@ func (j *Job) Release() {
 	}
 	if !j.inUse.CompareAndSwap(true, false) {
 		return
+	}
+	if done := j.onDone; done != nil {
+		j.onDone = nil
+		done()
 	}
 	j.ID = ""
 	j.Data = nil
