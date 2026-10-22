@@ -14,7 +14,9 @@ import (
 type PollerConfig struct {
 	// Interval is the time between poll attempts
 	Interval time.Duration
-	// BatchSize is the maximum number of items to process per batch iteration
+	// BatchSize is the expected number of items per Fetch. Every fetched item is
+	// always processed; when a Fetch returns BatchSize items or more, the poller
+	// fetches again right away instead of waiting for the next interval.
 	BatchSize int
 	// JobSlotSize controls how many concurrent poll operations are allowed to fetch data.
 	// A slot only covers fetch + submit, not job processing, unless WaitForCompletion is set.
@@ -180,14 +182,7 @@ func (p *Poller) pollOnce() (int, error) {
 		return 0, nil
 	}
 
-	originalLen := len(data)
-
-	// Limit batch size if configured
-	if p.config.BatchSize > 0 && len(data) > p.config.BatchSize {
-		LogFramework("WARNING", "Poller", fmt.Sprintf("limiting batch size from %d to %d", len(data), p.config.BatchSize))
-		data = data[:p.config.BatchSize]
-	}
-
+	// Every fetched item is submitted; nothing is cut off by BatchSize.
 	var pending sync.WaitGroup
 
 	for _, item := range data {
@@ -218,9 +213,9 @@ func (p *Poller) pollOnce() (int, error) {
 		// Use context.Background() to ensure data is never dropped due to context cancellation
 		// while waiting in the SubmitBlocking retry loop (100% Data Guarantee).
 		if err := p.workerPool.SubmitBlocking(context.Background(), job); err != nil {
-			if p.ctx.Err() == nil {
-				LogFramework("ERROR", "Poller", fmt.Sprintf("failed to submit job: %v", err))
-			}
+			// Only happens when the worker pool is stopped: keep the item in the recovery file.
+			LogFramework("ERROR", "Poller", fmt.Sprintf("failed to submit job %s: %v", job.ID, err))
+			p.workerPool.dumpJobToRecovery(job)
 			job.Release()
 		}
 	}
@@ -229,7 +224,7 @@ func (p *Poller) pollOnce() (int, error) {
 		p.waitForJobs(&pending)
 	}
 
-	return originalLen, nil
+	return len(data), nil
 }
 
 // waitForJobs blocks until all jobs from the current poll are released,

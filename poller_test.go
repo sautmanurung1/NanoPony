@@ -70,26 +70,24 @@ func TestPollerConfig(t *testing.T) {
 	}
 }
 
-func TestPollerBatchSizeLimit(t *testing.T) {
-	pool := NewWorkerPool(1, 5, 1)
+func TestPollerProcessesAllFetchedItems(t *testing.T) {
+	pool := NewWorkerPool(2, 5, 1)
 	ctx := context.Background()
 
 	var processed atomic.Int64
 	pool.Start(ctx, func(ctx context.Context, job *Job) error {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 		processed.Add(1)
 		return nil
 	})
 	defer pool.Stop()
 
-	// Create fetcher that returns more data than batch size
+	// Two fetches return more items than BatchSize, then no more data
 	var fetchCount atomic.Int64
 	fetcher := DataFetcherFunc(func(ctx context.Context) ([]any, error) {
-		count := fetchCount.Add(1)
-		if count >= 3 {
+		if fetchCount.Add(1) > 2 {
 			return []any{}, nil
 		}
-		// Return 20 items, but batch size will limit to 5
 		data := make([]any, 20)
 		for i := range data {
 			data[i] = "item"
@@ -99,20 +97,20 @@ func TestPollerBatchSizeLimit(t *testing.T) {
 
 	config := DefaultPollerConfig()
 	config.Interval = 50 * time.Millisecond
-	config.JobSlotSize = 1
-	config.BatchSize = 5 // Limit batch size
+	config.BatchSize = 5
 
 	poller := NewPoller(config, pool, fetcher)
 	poller.Start()
+	defer poller.Stop()
 
-	// Wait for polling to complete
-	time.Sleep(200 * time.Millisecond)
-	poller.Stop()
-
-	// Each poll should only process 5 items (not 20)
-	// With 2 successful polls, should have ~10 items processed
-	if processed.Load() > 15 {
-		t.Errorf("Expected ~10 jobs processed (limited by BatchSize=5), got %d", processed.Load())
+	// Every fetched item must be processed, none cut off by BatchSize
+	deadline := time.Now().Add(3 * time.Second)
+	for processed.Load() < 40 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := processed.Load(); got != 40 {
+		t.Errorf("expected all 40 fetched items processed, got %d", got)
 	}
 }
 
