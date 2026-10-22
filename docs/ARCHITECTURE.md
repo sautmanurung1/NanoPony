@@ -440,6 +440,7 @@ type KafkaWriterConfig struct {
 | `ELASTIC_PASSWORD` | Password Elasticsearch | `secret` |
 | `ELASTIC_INDEX_DATA` | Nama index Elasticsearch | `nanopony-logs` |
 | `LOG_OUTPUT_MODE` | Mode output logger | `console`, `file`, `elasticsearch`, `hybrid` |
+| `LOG_BUFFER_SIZE` | Kapasitas buffer log per channel | Angka, default `10000` |
 | `LOG_FILE_PREFIX` | Prefix nama file log | `any-prefix` (Default: `orion-to-core`) |
 
 ### Struktur Konfigurasi

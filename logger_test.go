@@ -1,8 +1,11 @@
 package nanopony
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -364,5 +367,100 @@ func TestLoggerConsoleCreatesFile(t *testing.T) {
 	files, err := os.ReadDir("./logs")
 	if err != nil || len(files) == 0 {
 		t.Errorf("Expected log file to be created for console mode, got error or no files: %v", err)
+	}
+}
+
+func newTestLogRequest(level string) logRequest {
+	return logRequest{entry: &LoggerEntry{Level: level}, mode: "console"}
+}
+
+func TestEnqueueLogNeverDrops(t *testing.T) {
+	ch := make(chan logRequest, 1)
+
+	// Slow sink
+	received := make(chan int)
+	go func() {
+		n := 0
+		for range ch {
+			time.Sleep(100 * time.Microsecond)
+			pendingLogs.Add(-1)
+			n++
+		}
+		received <- n
+	}()
+
+	// Far more logs than the buffer holds, every level
+	const total = 500
+	levels := []string{"DEBUG", "INFO", "WARNING", "ERROR"}
+	for i := 0; i < total; i++ {
+		enqueueLog(ch, newTestLogRequest(levels[i%len(levels)]))
+	}
+	close(ch)
+
+	if n := <-received; n != total {
+		t.Errorf("expected all %d logs delivered, got %d", total, n)
+	}
+}
+
+func TestElasticsearchFailureFallsBackToFile(t *testing.T) {
+	esClientMutex.Lock()
+	esClient = nil
+	esClientMutex.Unlock()
+	t.Setenv("ELASTIC_HOST", "")
+
+	msg := fmt.Sprintf("es-fallback-%d", time.Now().UnixNano())
+	logger := NewLoggerFromOptions(LoggerOptions{ServiceName: "es-fallback-test"})
+	logger.SendToElasticSearch("INFO", nil, ResponseLog{Message: msg})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := FlushLogs(ctx); err != nil {
+		t.Fatalf("flush failed: %v", err)
+	}
+
+	data, err := os.ReadFile(logFileWriter.Filename)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	if !strings.Contains(string(data), msg) {
+		t.Errorf("expected log %q in %s after Elasticsearch failure", msg, logFileWriter.Filename)
+	}
+}
+
+func TestFlushLogs(t *testing.T) {
+	pendingLogs.Add(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := FlushLogs(ctx); err == nil {
+		t.Error("expected flush to time out while a log is pending")
+	}
+
+	pendingLogs.Add(-1)
+	if err := FlushLogs(context.Background()); err != nil {
+		t.Errorf("expected flush to succeed, got %v", err)
+	}
+
+	// Real pipeline: everything queued gets written.
+	logger := NewLoggerFromOptions(LoggerOptions{ServiceName: "flush-test"})
+	for i := 0; i < 100; i++ {
+		logger.SendToFile("INFO", ResponseLog{Message: "flush"})
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	if err := FlushLogs(ctx2); err != nil {
+		t.Errorf("expected queued logs to be flushed, got %v", err)
+	}
+}
+
+func TestEnvInt(t *testing.T) {
+	t.Setenv("NANOPONY_TEST_INT", "42")
+	if got := envInt("NANOPONY_TEST_INT", 7); got != 42 {
+		t.Errorf("expected 42, got %d", got)
+	}
+	for _, v := range []string{"", "abc", "0", "-5"} {
+		t.Setenv("NANOPONY_TEST_INT", v)
+		if got := envInt("NANOPONY_TEST_INT", 7); got != 7 {
+			t.Errorf("value %q: expected default 7, got %d", v, got)
+		}
 	}
 }

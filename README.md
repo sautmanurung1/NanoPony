@@ -291,6 +291,7 @@ NanoPony menggunakan environment variables untuk konfigurasi:
 | `API_SECRET_KAFKA_CONFLUENT`       | API Secret Confluent Cloud | `xxx`                                                                     |
 | `BOOTSTRAP_SERVER_KAFKA_CONFLUENT` | Bootstrap server Confluent | `pkc-xxx.us-east-1.aws.confluent.cloud:9092`                              |
 | `LOG_OUTPUT_MODE`                  | Mode output log            | `console`, `file`, `elasticsearch`, `hybrid`                              |
+| `LOG_BUFFER_SIZE`                  | Kapasitas buffer log per channel. Log tidak pernah di-drop; saat penuh pemanggil menunggu | Angka, default `10000` |
 | `LOG_FILE_PREFIX`                  | Prefix nama file log       | `any-prefix` (Default: `orion-to-core`)                                   |
 
 ### Contoh `.env` File

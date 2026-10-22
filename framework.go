@@ -411,6 +411,7 @@ func (fc *FrameworkComponents) CheckReadiness(ctx context.Context) error {
 // 3. Shutdown all services
 // 4. Close all repositories
 // 5. Run all cleanup functions concurrently
+// 6. Flush buffered logs (bounded by ctx)
 //
 // If multiple errors occur, they are all collected and returned as an aggregated error.
 // Returns nil if all shutdowns succeeded.
@@ -450,6 +451,9 @@ func (fc *FrameworkComponents) Shutdown(ctx context.Context) error {
 	}
 
 	wg.Wait()
+
+	// Write logs still buffered before the process exits
+	collectErr(FlushLogs(ctx))
 
 	// Return aggregated errors or nil
 	return errors.Join(allErrors...)

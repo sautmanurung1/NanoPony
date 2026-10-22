@@ -2,11 +2,14 @@ package nanopony
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
@@ -32,7 +35,42 @@ var (
 	onceCachedWd sync.Once
 
 	onceDirChecked sync.Once
+
+	// pendingLogs counts logs queued but not yet written, per sink.
+	pendingLogs atomic.Int64
 )
+
+const defaultLogBufferSize = 10000
+
+// FlushLogs waits until every queued log has been written, or ctx is done.
+func FlushLogs(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for pendingLogs.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("flush logs: %d still pending: %w", pendingLogs.Load(), ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	return nil
+}
+
+// envInt reads a positive integer env var, falling back to def.
+func envInt(name string, def int) int {
+	if n, err := strconv.Atoi(os.Getenv(name)); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+// enqueueLog puts req on ch. Logs are never dropped: when ch is full the
+// caller waits until a worker frees space.
+func enqueueLog(ch chan logRequest, req logRequest) {
+	pendingLogs.Add(1)
+	ch <- req
+}
 
 // logRequest represents an internal request to process a log entry.
 type logRequest struct {
@@ -74,15 +112,18 @@ func (le *LoggerEntry) cloneUnlocked() *LoggerEntry {
 // initLogWorker initializes the background log processing goroutines exactly once.
 func initLogWorker() {
 	onceWorker.Do(func() {
-		logChan = make(chan logRequest, 1000)
-		consoleChan = make(chan logRequest, 1000)
-		fileChan = make(chan logRequest, 1000)
-		esChan = make(chan logRequest, 1000)
+		size := envInt("LOG_BUFFER_SIZE", defaultLogBufferSize)
+
+		logChan = make(chan logRequest, size)
+		consoleChan = make(chan logRequest, size)
+		fileChan = make(chan logRequest, size)
+		esChan = make(chan logRequest, size)
 
 		// Main Dispatcher Worker
 		go func() {
 			for req := range logChan {
 				dispatchLogRequest(req)
+				pendingLogs.Add(-1)
 			}
 		}()
 
@@ -93,6 +134,7 @@ func initLogWorker() {
 				if req.mode == "console" {
 					req.entry.writeToLogFile()
 				}
+				pendingLogs.Add(-1)
 			}
 		}()
 
@@ -100,14 +142,20 @@ func initLogWorker() {
 		go func() {
 			for req := range fileChan {
 				req.entry.writeToLogFile()
+				pendingLogs.Add(-1)
 			}
 		}()
 
 		// Dedicated Elasticsearch Worker (Realtime/Network dependent)
 		go func() {
 			for req := range esChan {
-				// Use the payload already inside req.entry
-				req.entry.writeToElasticsearch(nil)
+				// Use the payload already inside req.entry.
+				// If Elasticsearch fails, keep the log in the file instead of losing it
+				// (hybrid already writes the file through fileChan).
+				if !req.entry.writeToElasticsearch(nil) && req.mode != "hybrid" {
+					req.entry.writeToLogFile()
+				}
+				pendingLogs.Add(-1)
 			}
 		}()
 	})
@@ -135,16 +183,12 @@ func dispatchLogRequest(req logRequest) {
 	}
 }
 
-// sendToSink attempts to send a request to a sink channel without blocking the dispatcher.
+// sendToSink sends a request to a sink channel, waiting while the sink is full.
 func sendToSink(ch chan logRequest, req logRequest) {
 	if ch == nil {
 		return
 	}
-	select {
-	case ch <- req:
-	default:
-		// If a specific sink is full, we drop the log for THAT sink only.
-	}
+	enqueueLog(ch, req)
 }
 
 // initLoggerFile sets up the rolling file writer exactly once.
@@ -201,14 +245,15 @@ func (le *LoggerEntry) writeToConsole() {
 
 // writeToElasticsearch sends the entry and its payload to an Elasticsearch index.
 // The index name follows the pattern: <ELASTIC_PREFIX_INDEX><YYYYMMDD>
-func (le *LoggerEntry) writeToElasticsearch(payload any) {
+// Returns false when the log was not stored in Elasticsearch.
+func (le *LoggerEntry) writeToElasticsearch(payload any) bool {
 	if err := ensureElasticsearchClient(); err != nil {
-		return
+		return false
 	}
 
 	conf := getAppConfig()
 	if conf == nil {
-		return
+		return false
 	}
 
 	payloadMap := processPayload(payload)
@@ -220,16 +265,21 @@ func (le *LoggerEntry) writeToElasticsearch(payload any) {
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[NanoPony-Logger] Failed to marshal log for Elasticsearch: %v\n", err)
-		return
+		return false
 	}
 
 	esIndexWithDate := conf.ElasticSearch.ElasticPrefixIndex + time.Now().Format("20060102")
 	res, err := esClient.Index(esIndexWithDate, bytes.NewReader(data))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[NanoPony-Logger] Failed to send log to Elasticsearch: %v\n", err)
-		return
+		return false
 	}
-	_ = res.Body.Close()
+	defer res.Body.Close()
+	if res.IsError() {
+		fmt.Fprintf(os.Stderr, "[NanoPony-Logger] Elasticsearch rejected log: %s\n", res.Status())
+		return false
+	}
+	return true
 }
 
 // processPayload normalizes various payload types into a map[string]any for JSON logging.

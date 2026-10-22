@@ -6,7 +6,7 @@
 //	   ↓
 //	LoggerEntry.LoggingData(level, payload, response)
 //	   ↓
-//	logChan (buffered channel, cap=1000)
+//	logChan (buffered channel, cap=LOG_BUFFER_SIZE, default 10000)
 //	   ↓
 //	background dispatcher goroutine
 //	   ↓ dispatches to specialized sink workers (non-blocking):
@@ -14,8 +14,9 @@
 //	   ├── fileWorker          → rolling log file (lumberjack)
 //	   └── esWorker            → ES index
 //
-// All logging is non-blocking. If a specific sink's channel is full, that
-// specific output is dropped to prevent blocking the entire logging pipeline.
+// Logs are never dropped. When a channel is full, the caller waits until a
+// worker frees space. If Elasticsearch fails, the log is written to the log
+// file instead. Call FlushLogs before exit to write logs still in the buffers.
 package nanopony
 
 import (
@@ -154,11 +155,7 @@ func (le *LoggerEntry) sendLog(level, mode string, payload any, response Respons
 	le.mu.Unlock()
 
 	if logChan != nil {
-		select {
-		case logChan <- logRequest{entry: snapshot, mode: mode}:
-		default:
-			fmt.Printf("[WARNING] Log channel full, dropping log\n")
-		}
+		enqueueLog(logChan, logRequest{entry: snapshot, mode: mode})
 	}
 }
 
