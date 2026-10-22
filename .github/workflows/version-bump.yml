@@ -35,7 +35,7 @@ jobs:
       - name: Get commits since last tag
         id: commits
         run: |
-          COMMITS=$(git log ${{ steps.get_tag.outputs.last_tag }}..HEAD --oneline)
+          COMMITS=$(git log ${{ steps.get_tag.outputs.last_tag }}..HEAD --format=%s)
           echo "$COMMITS"
 
           echo "commits<<EOF" >> $GITHUB_OUTPUT
